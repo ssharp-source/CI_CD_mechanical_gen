@@ -1,0 +1,239 @@
+name: HW Gen -> QC -> Feedback Loop
+
+# Trigger on pushes to branches named gen/* OR manual dispatch (prompt provided)
+on:
+  push:
+    branches:
+      - 'gen/**'
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'User prompt to generate hardware'
+        required: true
+        type: string
+      target_branch:
+        description: 'branch to commit generated artifacts to'
+        required: false
+        default: 'gen/auto'
+
+concurrency:
+  group: hw-gen-pipeline
+  cancel-in-progress: true
+
+env:
+  # change these to your infra endpoints via repo secrets or environment protection
+  VECTOR_DB_URL: ${{ secrets.VECTOR_DB_URL }}
+  OLLAMA_URL: ${{ secrets.OLLAMA_URL }}         # e.g. http://ollama:11434 (if self-hosted)
+  OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+  OPENSCAD_CLI_IMAGE: "openscad/openscad:latest" # example docker image; replace with validated image
+  UNITY_DOCKER_IMAGE: ${{ secrets.UNITY_DOCKER_IMAGE }} # docker image with Unity CLI headless (must be provided)
+  FEEDBACK_WEBHOOK: ${{ secrets.FEEDBACK_WEBHOOK }}     # endpoint to collect user feedback
+  GITHUB_ARTIFACT_NAME: "generated-hw"
+
+jobs:
+
+  prepare:
+    name: Prepare & Checkout
+    runs-on: ubuntu-latest
+    outputs:
+      prompt: ${{ steps.get_prompt.outputs.prompt }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get prompt (workflow_dispatch or commit message fallback)
+        id: get_prompt
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "::set-output name=prompt::${{ github.event.inputs.prompt }}"
+          else
+            # If commit message contains "PROMPT: ..." use it
+            PROMPT=$(git log -1 --pretty=%B | sed -n 's/.*PROMPT:\s*\(.*\)/\1/p' )
+            if [ -z "$PROMPT" ]; then
+              echo "No prompt found in commit message. Exiting."
+              exit 1
+            fi
+            echo "::set-output name=prompt::$PROMPT"
+          fi
+
+  generate:
+    name: Generate parametric model (RAG + LLM)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install generator deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tools/requirements-generator.txt
+
+      - name: Run generator (RAG -> OpenSCAD)
+        id: gen
+        env:
+          OLLAMA_URL: ${{ env.OLLAMA_URL }}
+          OLLAMA_API_KEY: ${{ env.OLLAMA_API_KEY }}
+          VECTOR_DB_URL: ${{ env.VECTOR_DB_URL }}
+        run: |
+          PROMPT="${{ needs.prepare.outputs.prompt }}"
+          echo "Running generator with prompt: ${PROMPT}"
+          python tools/generate_scad.py --prompt "${PROMPT}" --out-dir generated || (echo "Generator failed" && exit 2)
+          ls -la generated
+          # produce metadata
+          jq -n --arg p "$PROMPT" '{"prompt":$p}' > generated/metadata.json
+        # expected outputs in generated/: model.scad, model.stl (optional), metadata.json
+
+      - name: Save generated artifacts as action outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.GITHUB_ARTIFACT_NAME }}
+          path: generated/
+
+  render_stl:
+    name: Render SCAD -> STL (OpenSCAD)
+    needs: generate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.GITHUB_ARTIFACT_NAME }}
+          path: generated
+
+      - name: Render with OpenSCAD in Docker
+        run: |
+          if [ ! -f generated/model.scad ]; then
+            echo "No model.scad found, exiting."
+            exit 1
+          fi
+          docker run --rm -v $PWD/generated:/work -w /work $OPENSCAD_CLI_IMAGE openscad -o model.stl model.scad
+          ls -la generated
+
+      - name: Upload STL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stl-artifact
+          path: generated/model.stl
+
+  simulate_qc:
+    name: Headless simulation (Unity) + Scoring
+    needs: render_stl
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download STL
+        uses: actions/download-artifact@v4
+        with:
+          name: stl-artifact
+          path: sim_input
+
+      - name: Prepare unity runner image (pull)
+        run: |
+          echo "Ensure UNITY image is available: $UNITY_DOCKER_IMAGE"
+          docker pull $UNITY_DOCKER_IMAGE || true
+
+      - name: Run headless Unity simulation container
+        env:
+          UNITY_SCENE: "Assets/SimScenes/PhysicsTest.unity"   # update to your scene path
+          SIM_OUTPUT: "/sim/out/score.json"
+        run: |
+          mkdir -p sim_out
+          # Example: run Docker container with Unity Player and a custom runner script inside container that:
+          # - imports the STL,
+          # - runs physics scenario,
+          # - exports metrics as JSON.
+          docker run --rm -v $PWD/sim_input:/sim/in -v $PWD/sim_out:/sim/out $UNITY_DOCKER_IMAGE \
+            /bin/bash -lc "chmod +x /unity_runner/run_sim.sh && /unity_runner/run_sim.sh /sim/in/model.stl /sim/out/score.json"
+          cat sim_out/score.json || (echo "No score produced" && exit 2)
+
+      - name: Upload score
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-score
+          path: sim_out/score.json
+
+  qc_decision:
+    name: QC decision + feedback prompt
+    needs: simulate_qc
+    runs-on: ubuntu-latest
+    outputs:
+      score: ${{ steps.read_score.outputs.score }}
+    steps:
+      - name: Download score
+        uses: actions/download-artifact@v4
+        with:
+          name: sim-score
+          path: sim_out
+
+      - name: Read score
+        id: read_score
+        run: |
+          SCORE=$(jq -r '.fitness_score // .score // empty' sim_out/score.json || echo "")
+          if [ -z "$SCORE" ]; then
+            echo "SCORE not found, defaulting to 0"
+            SCORE=0
+          fi
+          echo "Score is $SCORE"
+          echo "::set-output name=score::$SCORE"
+
+      - name: Create review issue for user feedback (optional)
+        if: always()
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: "Review generated HW - ${{ github.sha }}"
+          content-filepath: tools/issue_template.md
+          labels: review,generated-hw
+
+  feedback_and_retrain:
+    name: Publish + Feedback -> Update DB
+    needs: qc_decision
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download generated artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.GITHUB_ARTIFACT_NAME }}
+          path: generated
+
+      - name: Download score
+        uses: actions/download-artifact@v4
+        with:
+          name: sim-score
+          path: sim_out
+
+      - name: Send summary to feedback endpoint
+        run: |
+          SCORE=${{ needs.qc_decision.outputs.score }}
+          PROMPT="${{ needs.prepare.outputs.prompt }}"
+          PAYLOAD=$(jq -n --arg p "$PROMPT" --arg s "$SCORE" --arg sha "${{ github.sha }}" '{"prompt":$p,"score":($s|tonumber),"sha":$sha}')
+          echo "Sending feedback payload: $PAYLOAD"
+          curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "${{ env.FEEDBACK_WEBHOOK }}" || echo "Feedback webhook failed"
+
+      - name: Update Vector DB with sample + score
+        env:
+          VECTOR_DB_URL: ${{ env.VECTOR_DB_URL }}
+        run: |
+          python tools/update_vector_db.py --dir generated --score ${{ needs.qc_decision.outputs.score }}
+
+      - name: Commit generated artifacts to branch (optionally)
+        env:
+          GIT_USER_NAME: "hw-gen-bot"
+          GIT_USER_EMAIL: "bot@example.com"
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch || 'gen/auto' }}"
+          git config user.name "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git checkout -b $TARGET_BRANCH || git checkout $TARGET_BRANCH
+          cp -r generated/* .
+          git add generated || true
+          git commit -m "chore: add generated artifacts from ${GITHUB_RUN_ID}" || echo "nothing to commit"
+          git push origin HEAD:$TARGET_BRANCH --force
