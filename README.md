@@ -15,6 +15,9 @@ as for simulation inital though is physics engine in unity to simulate effects (
 ### use case 
 scale comput based on task, llm using GPUs while openscad would be fine with cpu 
 
+## notes
+
+the pyton app  wrapper is the glue. It should live behind auth, with strict rate limits and auditing. Use this skeleton, iterate, and don’t skimp on deterministic test data or seed values for consistent RAG decisions.
 
 ## Deployment & operational notes 
 
